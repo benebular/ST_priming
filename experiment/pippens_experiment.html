@@ -280,6 +280,7 @@ const State = {
   audioOffsetTs: null,
   awaitingChoice: false,
   rowsLocal: [],
+  preloadedGifs: {},
 };
 
 /* ===========================
@@ -348,6 +349,16 @@ function currentTrial(){
 
 function resolveGifUrl(trial){
   if(!trial.prime_text) return "";
+  const match = resolveGifMatch(trial);
+  if(!match){
+    console.warn(`No GIF match found for prime: ${trial.prime_text}`);
+    return "";
+  }
+  return `${CONFIG.gifBase}/${encodeURIComponent(match)}`;
+}
+
+function resolveGifMatch(trial){
+  if(!trial.prime_text) return null;
   const primeKey = String(trial.prime_text).trim().toUpperCase();
   const match = (CONFIG.gifFiles || []).find(filename => {
     const upper = filename.toUpperCase();
@@ -358,11 +369,7 @@ function resolveGifUrl(trial){
       || base.startsWith(`${primeKey}-`)
       || base.startsWith(`${primeKey}_`);
   });
-  if(!match){
-    console.warn(`No GIF match found for prime: ${trial.prime_text}`);
-    return "";
-  }
-  return `${CONFIG.gifBase}/${encodeURIComponent(match)}`;
+  return match || null;
 }
 
 function sleep(ms){
@@ -581,9 +588,66 @@ function startTrials(){
   setChoiceVisible(false);
   setChoiceEnabled(false);
 
-  show("screen-trials");
-  State.trialIndex = 0;
-  loadTrial();
+  // Preload GIFs so trials don't show blank frames due to network/file latency
+  (async () => {
+    primeDisplay.textContent = "Loading assets...";
+    const results = await preloadGifs();
+    const failed = results.filter(r => !r.ok).map(r => r.filename);
+    if(failed.length){
+      console.warn("GIF preload failures:", failed);
+      State.missingGifs = failed;
+    }
+    // Ready to start
+    primeDisplay.textContent = "+";
+    show("screen-trials");
+    State.trialIndex = 0;
+    loadTrial();
+  })();
+}
+
+// Preload GIF files listed in CONFIG.gifFiles. Returns array of { filename, url, ok, reason? }
+function preloadGifs(){
+  const files = Array.isArray(CONFIG.gifFiles) ? CONFIG.gifFiles.slice() : [];
+  return new Promise(resolve => {
+    const results = [];
+    if(files.length === 0) return resolve(results);
+    let pending = files.length;
+    files.forEach(filename => {
+      const url = `${CONFIG.gifBase}/${encodeURIComponent(filename)}`;
+      const img = new Image();
+      let settled = false;
+      const to = setTimeout(() => {
+        if(settled) return;
+        settled = true;
+        results.push({ filename, url, ok: false, reason: 'timeout' });
+        if(--pending === 0) resolve(results);
+      }, 3000);
+
+      img.onload = () => {
+        if(settled) return;
+        settled = true;
+        clearTimeout(to);
+        // Store preloaded Image element keyed by uppercase base name (without suffix)
+        const key = filename.toUpperCase().endsWith(CONFIG.gifSuffix.toUpperCase())
+          ? filename.toUpperCase().slice(0, -CONFIG.gifSuffix.length)
+          : filename.toUpperCase();
+        try{
+          State.preloadedGifs[key] = img;
+        } catch(e) {}
+        results.push({ filename, url, ok: true });
+        if(--pending === 0) resolve(results);
+      };
+      img.onerror = () => {
+        if(settled) return;
+        settled = true;
+        clearTimeout(to);
+        results.push({ filename, url, ok: false, reason: 'error' });
+        if(--pending === 0) resolve(results);
+      };
+      // kick off loading
+      img.src = url;
+    });
+  });
 }
 
 function setChoiceEnabled(enabled){
@@ -671,9 +735,66 @@ async function runTimedTrialSequence(trial, token){
   if(trial.prime_type === "gif"){
     const gifUrl = resolveGifUrl(trial);
     if(gifUrl){
-      primeDisplay.innerHTML = `<img src="${gifUrl}" alt="${trial.prime_text}" style="border-radius:8px;" />`;
+      // Preload the GIF and wait for a short timeout so we don't display a blank box
+      // Try using preloaded Image if available (faster, avoids re-download)
+      const match = resolveGifMatch(trial);
+      const matchKey = match ? (match.toUpperCase().endsWith(CONFIG.gifSuffix.toUpperCase()) ? match.toUpperCase().slice(0, -CONFIG.gifSuffix.length) : match.toUpperCase()) : null;
+      if(matchKey && State.preloadedGifs && State.preloadedGifs[matchKey]){
+        // Use preloaded image
+        try{
+          const pre = State.preloadedGifs[matchKey];
+          primeDisplay.innerHTML = "";
+          const el = new Image();
+          el.src = pre.src;
+          el.alt = trial.prime_text || "";
+          el.style.borderRadius = '8px';
+          primeDisplay.appendChild(el);
+        } catch(e){
+          console.warn('Error using preloaded GIF for', matchKey, e);
+          primeDisplay.innerHTML = `<img src="${gifUrl}" alt="${trial.prime_text}" style="border-radius:8px;" />`;
+        }
+      } else {
+        // Preload the GIF and wait for a slightly longer timeout so we don't display a blank box
+        const imgLoaded = await (async () => {
+          return new Promise(resolve => {
+            const img = new Image();
+            let settled = false;
+            const to = setTimeout(() => {
+              if (!settled) {
+                settled = true;
+                console.warn(`GIF load timeout for ${trial.prime_text}`);
+                resolve(false);
+              }
+            }, 1500);
+
+            img.onload = () => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(to);
+              resolve(true);
+            };
+            img.onerror = () => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(to);
+              console.warn(`GIF failed to load for ${trial.prime_text}: ${gifUrl}`);
+              resolve(false);
+            };
+            // Start loading
+            img.src = gifUrl;
+          });
+        })();
+
+        if(imgLoaded){
+          primeDisplay.innerHTML = `<img src="${gifUrl}" alt="${trial.prime_text}" style="border-radius:8px;" />`;
+        } else {
+          // Fallback: show the prime text so participant is not presented with a blank
+          primeDisplay.textContent = trial.prime_text || "";
+        }
+      }
     } else {
-      primeDisplay.textContent = "";
+      // No match found for GIF, show prime text as fallback
+      primeDisplay.textContent = trial.prime_text || "";
     }
     await sleep(CONFIG.gifPrimeDisplayMs);
   } else {
